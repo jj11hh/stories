@@ -1,70 +1,79 @@
-# GitHub Codespaces ♥️ React
+# Stories
 
-Welcome to your shiny new Codespace running React! We've got everything fired up and running for you to explore React.
+A Context Engineering Agent Demo - A visual interface for managing AI agent conversation contexts with intelligent context window management.
 
-You've got a blank canvas to work on from a git perspective as well. There's a single initial commit with the what you're seeing right now - where you go from here is up to you!
+## Architecture
 
-Everything you do here is contained within this one codespace. There is no repository on GitHub yet. If and when you’re ready you can click "Publish Branch" and we’ll create your repository and push up your project. If you were just exploring then and have no further need for this code then you can simply delete your codespace and it's gone forever.
+- **Frontend**: React + Vite + Tailwind CSS (dark theme)
+- **Backend**: Express.js + TypeScript + AI SDK
+- **AI Provider**: OpenAI (GPT-4o)
 
-This project was bootstrapped for you with [Vite](https://vitejs.dev/).
+## Features
 
-## Available Scripts
+- **Visual Context Management**: Track and visualize agent conversation nodes in real-time
+- **Story Branching**: Create and switch between different conversation branches
+- **Context Window**: Automatic context eviction with token-aware windowing
+- **Meta-Agent Compression**: AI-powered context compression to prevent context overflow
+- **Fork & Merge**: Branch from any historical point in the conversation
 
-In the project directory, you can run:
+## Getting Started
 
-### `npm start`
+### Prerequisites
 
-We've already run this for you in the `Codespaces: server` terminal window below. If you need to stop the server for any reason you can just run `npm start` again to bring it back online.
+- Node.js 18+
+- OpenAI API Key
 
-Runs the app in the development mode.\
-Open [http://localhost:3000/](http://localhost:3000/) in the built-in Simple Browser (`Cmd/Ctrl + Shift + P > Simple Browser: Show`) to view your running application.
+### Installation
 
-The page will reload automatically when you make changes.\
-You may also see any lint errors in the console.
+```bash
+# Install frontend dependencies
+npm install
 
-### `npm test`
+# Install backend dependencies
+cd server && npm install
+```
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+### Configuration
 
-### `npm run build`
+Create a `.env` file in the `server/` directory with your OpenAI credentials:
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+```bash
+cd server
+cp .env.example .env
+# Edit .env with your actual API key
+```
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+Required environment variables:
+- `STORIES_API_BASE_URL` - LLM API base URL (e.g., `https://api.openai.com/v1`)
+- `STORIES_API_KEY` - Your API key
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+The server will refuse to start if these variables are not set.
 
-## Learn More
+### Running
 
-You can learn more in the [Vite documentation](https://vitejs.dev/guide/).
+```bash
+# Terminal 1: Start backend (port 3001)
+cd server && npm run dev
 
-To learn Vitest, a Vite-native testing framework, go to [Vitest documentation](https://vitest.dev/guide/)
+# Terminal 2: Start frontend (port 3000)
+npm start
+```
 
-To learn React, check out the [React documentation](https://reactjs.org/).
+Access the app at [http://localhost:3000](http://localhost:3000)
 
-### Code Splitting
+## API Endpoints
 
-This section has moved here: [https://sambitsahoo.com/blog/vite-code-splitting-that-works.html](https://sambitsahoo.com/blog/vite-code-splitting-that-works.html)
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/state` | Get current context state |
+| POST | `/api/chat` | Send message to agent |
+| POST | `/api/action` | Perform actions (fork, collapse, recycle, etc.) |
 
-### Analyzing the Bundle Size
+## Tech Stack
 
-This section has moved here: [https://github.com/btd/rollup-plugin-visualizer#rollup-plugin-visualizer](https://github.com/btd/rollup-plugin-visualizer#rollup-plugin-visualizer)
-
-### Making a Progressive Web App
-
-This section has moved here: [https://dev.to/hamdankhan364/simplifying-progressive-web-app-pwa-development-with-vite-a-beginners-guide-38cf](https://dev.to/hamdankhan364/simplifying-progressive-web-app-pwa-development-with-vite-a-beginners-guide-38cf)
-
-### Advanced Configuration
-
-This section has moved here: [https://vitejs.dev/guide/build.html#advanced-base-options](https://vitejs.dev/guide/build.html#advanced-base-options)
-
-### Deployment
-
-This section has moved here: [https://vitejs.dev/guide/build.html](https://vitejs.dev/guide/build.html)
-
-### Troubleshooting
-
-This section has moved here: [https://vitejs.dev/guide/troubleshooting.html](https://vitejs.dev/guide/troubleshooting.html)
+- [React](https://react.dev/)
+- [Vite](https://vitejs.dev/)
+- [Tailwind CSS](https://tailwindcss.com/)
+- [Express](https://expressjs.com/)
+- [AI SDK](https://sdk.vercel.ai/)
+- [tsx](https://github.com/privatenumber/tsx)

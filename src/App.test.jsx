@@ -2,8 +2,13 @@ import { expect, test } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import App from './App';
 
-test('renders learn react link', () => {
+test('renders loading state before backend responds', () => {
+  const originalFetch = global.fetch;
+  global.fetch = () => new Promise(() => {});
+
   render(<App />);
-  const linkElement = screen.getByText(/learn react/i);
-  expect(linkElement).toBeDefined();
+  const loadingElement = screen.getByText(/connecting to backend/i);
+  expect(loadingElement).toBeDefined();
+
+  global.fetch = originalFetch;
 });

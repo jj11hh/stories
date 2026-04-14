@@ -3,19 +3,30 @@ import cors from 'cors';
 import crypto from 'crypto';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { generateText, generateObject, tool } from 'ai';
+import { generateText, Output, tool, stepCountIs } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
 import { z } from 'zod';
+import dotenv from 'dotenv';
+import type { Request, Response } from 'express';
+
+dotenv.config();
 
 const execAsync = promisify(exec);
 
 // ==========================================
-// 配置区 (Constants)
+// Configuration (Environment Variables)
 // ==========================================
-const BASE_URL = 'https://api.openai.com/v1'; // 替换为你的 Base URL
-const API_KEY = 'sk-xxxxxx';                  // 替换为你的 API KEY
-const MODEL_NAME = 'gpt-4o';                  // 主 Agent 模型
-const META_MODEL_NAME = 'gpt-4o-mini';        // Meta-Agent 可以用小模型
+const BASE_URL = process.env.STORIES_API_BASE_URL;
+const API_KEY = process.env.STORIES_API_KEY;
+
+if (!BASE_URL || !API_KEY) {
+  console.error('Error: Missing required environment variables');
+  console.error('Please set STORIES_API_BASE_URL and STORIES_API_KEY');
+  process.exit(1);
+}
+
+const MODEL_NAME = 'gpt-4o';
+const META_MODEL_NAME = 'gpt-4o-mini';
 
 const openai = createOpenAI({ baseURL: BASE_URL, apiKey: API_KEY });
 
@@ -151,7 +162,7 @@ app.use(cors());
 app.use(express.json());
 
 // 获取当前全景状态供 UI 渲染
-app.get('/api/state', (req, res) => {
+app.get('/api/state', (_req: Request, res: Response) => {
     const story = stories.get(activeStoryId)!;
     const window = windows.get(activeStoryId)!;
     const fullPath = graph.resolvePath(story.headSceneId);
@@ -178,8 +189,8 @@ app.get('/api/state', (req, res) => {
 });
 
 // 主 Agent 对话接口
-app.post('/api/chat', async (req, res) => {
-    const { message } = req.body;
+app.post('/api/chat', async (req: Request, res: Response) => {
+    const message = typeof req.body?.message === 'string' ? req.body.message : '';
     if (message) appendData(activeStoryId, 'user', message);
 
     const window = windows.get(activeStoryId)!;
@@ -197,14 +208,14 @@ ${renderedContext}
 =====================================`;
 
     try {
-        const { response } = await generateText({
+        const { text, steps } = await generateText({
             model: openai(MODEL_NAME),
             system: systemPrompt,
-            messages: [{ role: 'user', content: "请根据 Context 的最新状态继续执行任务。如果需要，直接调用工具。" }],
+            prompt: "请根据 Context 的最新状态继续执行任务。如果需要，直接调用工具。",
             tools: {
                 bash: tool({
                     description: '执行系统 bash 命令，返回 stdout 和 stderr',
-                    parameters: z.object({ command: z.string() }),
+                    inputSchema: z.object({ command: z.string() }),
                     execute: async ({ command }) => {
                         try {
                             const { stdout, stderr } = await execAsync(command);
@@ -215,36 +226,48 @@ ${renderedContext}
                     }
                 })
             },
-            maxSteps: 5, // 允许连续调用工具
+            stopWhen: stepCountIs(5), // 允许连续调用工具
         });
 
         // 提取并在架构中重构中间步骤
-        const steps = response.messages.slice(1); // 忽略我们发出的触发引导词
         for (const step of steps) {
-            if (step.role === 'assistant') {
-                const content = step.content || `[调用工具]: ${JSON.stringify(step.toolCalls)}`;
-                appendData(activeStoryId, 'assistant', content);
-            } else if (step.role === 'tool') {
-                appendData(activeStoryId, 'tool', JSON.stringify(step.content));
+            if (step.text.trim()) {
+                appendData(activeStoryId, 'assistant', step.text);
+            }
+
+            for (const toolCall of step.toolCalls) {
+                appendData(
+                    activeStoryId,
+                    'assistant',
+                    `[调用工具] ${toolCall.toolName}: ${JSON.stringify(toolCall.input)}`,
+                );
+            }
+
+            for (const toolResult of step.toolResults) {
+                appendData(activeStoryId, 'tool', JSON.stringify(toolResult.output ?? toolResult));
             }
         }
+
+        if (steps.length === 0 && text.trim()) appendData(activeStoryId, 'assistant', text);
         res.json({ success: true });
-    } catch (error: any) {
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
         console.error(error);
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: message });
     }
 });
 
 // 手动操作/工具接口
-app.post('/api/action', async (req, res) => {
+app.post('/api/action', async (req: Request, res: Response) => {
     const { action, sceneId, count, summary } = req.body;
     const window = windows.get(activeStoryId)!;
 
     if (action === 'switch_story') {
-        if (stories.has(req.body.storyId)) activeStoryId = req.body.storyId;
+        const storyId = typeof req.body?.storyId === 'string' ? req.body.storyId : '';
+        if (stories.has(storyId)) activeStoryId = storyId;
     }
     else if (action === 'edit_history') {
-        window.historySummary = summary;
+        window.historySummary = typeof summary === 'string' ? summary : '';
     }
     else if (action === 'recycle') {
         window.windowStartIndex += (count || 1);
@@ -276,23 +299,25 @@ app.post('/api/action', async (req, res) => {
             return { wid: state.wid, type: s.type, mode: state.mode, tokenCount: s.tokenCount, isEvicted: idx < window.windowStartIndex };
         }).filter(Boolean);
 
-        const { object } = await generateObject({
+        const { output } = await generateText({
             model: openai(META_MODEL_NAME),
             system: "你是一个 Meta-Agent。当前 Agent 的 Context 濒临过载，你需要输出压缩指令。只允许使用 collapse(折叠指定WID) 或 recycle(驱逐最老的N个Scene)。",
             prompt: `当前窗口快照:\n${JSON.stringify(snapshot, null, 2)}`,
-            schema: z.object({
-                actions: z.array(z.object({
-                    type: z.enum(['collapse', 'recycle']),
-                    wid: z.string().optional(),
-                    count: z.number().optional(),
-                    reason: z.string()
-                }))
+            output: Output.object({
+                schema: z.object({
+                    actions: z.array(z.object({
+                        type: z.enum(['collapse', 'recycle']),
+                        wid: z.string().optional(),
+                        count: z.number().optional(),
+                        reason: z.string()
+                    }))
+                })
             })
         });
 
         // 应用 Meta Agent 的操作
         const logs: string[] = [];
-        for (const act of object.actions) {
+        for (const act of output.actions) {
             if (act.type === 'collapse' && act.wid) {
                 const sId = Array.from(window.sceneStateMap.entries()).find(([k, v]) => v.wid === act.wid)?.[0];
                 if (sId) { window.sceneStateMap.get(sId)!.mode = DisplayMode.COLLAPSED; logs.push(`折叠了 ${act.wid}: ${act.reason}`); }
@@ -305,6 +330,10 @@ app.post('/api/action', async (req, res) => {
         return;
     }
     else if (action === 'fork') {
+        if (typeof sceneId !== 'string') {
+            res.status(400).json({ error: 'sceneId is required for fork action' });
+            return;
+        }
         const newStoryId = `fork_${Date.now()}`;
         const targetSceneId = sceneId;
         const sourceStory = stories.get(activeStoryId)!;
