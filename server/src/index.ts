@@ -3,6 +3,8 @@ import cors from 'cors';
 import crypto from 'crypto';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { dirname, resolve } from 'path';
+import { fileURLToPath } from 'url';
 import { generateText, Output, tool, stepCountIs } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
 import { z } from 'zod';
@@ -27,6 +29,15 @@ if (!BASE_URL || !API_KEY) {
 
 const MODEL_NAME = 'gpt-4o';
 const META_MODEL_NAME = 'gpt-4o-mini';
+const DEFAULT_CONTEXT_WINDOW = 128 * 1024;
+const MIN_RESERVE_TOKENS = 4 * 1024;
+const MAX_RESERVE_TOKENS = 32 * 1024;
+const DEFAULT_TOOL_TIMEOUT_MS = 20_000;
+const MAX_TOOL_TIMEOUT_MS = 120_000;
+const TOOL_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+const MAX_AUTO_COMPRESSION_PASSES = 2;
+const serverDir = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(serverDir, '..', '..');
 
 const openai = createOpenAI({ baseURL: BASE_URL, apiKey: API_KEY });
 
@@ -49,6 +60,26 @@ interface Scene {
 }
 
 interface Story { headSceneId: SceneId; }
+
+interface RuntimeModelConfig {
+    contextWindow: number;
+    reserveTokens: number;
+    compressionThreshold: number;
+    forkHistoryTargetTokens: number;
+    source: 'api' | 'fallback';
+}
+
+interface CompressionAction {
+    type: 'collapse' | 'recycle';
+    wid?: string;
+    count?: number;
+    reason: string;
+}
+
+interface CompressionResult {
+    logs: string[];
+    applied: boolean;
+}
 
 class StoryGraph {
     public nodes: Map<SceneId, Scene> = new Map();
@@ -110,7 +141,276 @@ const stories = new Map<string, Story>();
 const windows = new Map<string, ContextWindow>();
 let activeStoryId = 'story_main';
 
+let runtimeModelConfigPromise: Promise<RuntimeModelConfig> | null = null;
+
 const generateHash = (text: string) => crypto.createHash('md5').update(text + Math.random()).digest('hex').substring(0, 8);
+const estimateTokenCount = (text: string) => Math.max(1, Math.ceil(text.length / 4));
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
+
+function buildRuntimeModelConfig(contextWindow: number, source: 'api' | 'fallback'): RuntimeModelConfig {
+    const reserveTokens = clamp(Math.round(contextWindow * 0.15), MIN_RESERVE_TOKENS, MAX_RESERVE_TOKENS);
+    const compressionThreshold = Math.max(MIN_RESERVE_TOKENS, contextWindow - reserveTokens);
+    const forkHistoryTargetTokens = clamp(
+        Math.round(contextWindow * 0.25),
+        MIN_RESERVE_TOKENS,
+        Math.max(MIN_RESERVE_TOKENS, Math.floor(compressionThreshold * 0.6)),
+    );
+
+    return {
+        contextWindow,
+        reserveTokens,
+        compressionThreshold,
+        forkHistoryTargetTokens,
+        source,
+    };
+}
+
+function getModelsEndpoint(baseUrl: string): string {
+    return new URL('models', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`).toString();
+}
+
+function parsePositiveInteger(value: unknown): number | undefined {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.round(value);
+    if (typeof value === 'string') {
+        const parsed = Number.parseInt(value, 10);
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    return undefined;
+}
+
+function extractContextWindow(candidate: unknown, depth = 0): number | undefined {
+    if (!candidate || depth > 3 || typeof candidate !== 'object') return undefined;
+
+    const keyCandidates = [
+        'context_window',
+        'contextWindow',
+        'context_length',
+        'contextLength',
+        'max_context_length',
+        'maxContextLength',
+        'max_model_len',
+        'maxModelLen',
+        'input_token_limit',
+        'inputTokenLimit',
+        'num_ctx',
+    ];
+
+    for (const key of keyCandidates) {
+        const parsed = parsePositiveInteger((candidate as Record<string, unknown>)[key]);
+        if (parsed) return parsed;
+    }
+
+    for (const value of Object.values(candidate as Record<string, unknown>)) {
+        const nested = extractContextWindow(value, depth + 1);
+        if (nested) return nested;
+    }
+
+    return undefined;
+}
+
+async function discoverModelContextWindow(): Promise<RuntimeModelConfig> {
+    try {
+        const response = await fetch(getModelsEndpoint(BASE_URL), {
+            headers: {
+                Authorization: `Bearer ${API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Model discovery failed with HTTP ${response.status}`);
+        }
+
+        const payload = await response.json();
+        const models = Array.isArray(payload?.data) ? payload.data : [];
+        const matchingModel = models.find((model: any) => model?.id === MODEL_NAME) ?? models[0];
+        const discoveredContextWindow = extractContextWindow(matchingModel);
+
+        if (!discoveredContextWindow) {
+            throw new Error('Model metadata did not include a context window');
+        }
+
+        return buildRuntimeModelConfig(discoveredContextWindow, 'api');
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[stories] Falling back to ${DEFAULT_CONTEXT_WINDOW} tokens for ${MODEL_NAME}: ${message}`);
+        return buildRuntimeModelConfig(DEFAULT_CONTEXT_WINDOW, 'fallback');
+    }
+}
+
+async function getRuntimeModelConfig(): Promise<RuntimeModelConfig> {
+    if (!runtimeModelConfigPromise) {
+        runtimeModelConfigPromise = discoverModelContextWindow();
+    }
+    return runtimeModelConfigPromise;
+}
+
+function buildAgentSystemPrompt(renderedContext: string, runtimeConfig: RuntimeModelConfig): string {
+    return `你是 Stories 里的仓库内编码 Agent，负责在 ${REPO_ROOT} 中继续当前任务。
+
+工作方式（参考现代 coding agent / pi 风格）：
+1. 先理解目标，再检查仓库，再修改，再验证。
+2. CURRENT CONTEXT 是你的主要状态；若信息不足，优先用工具补齐事实，不要猜测。
+3. 工具调用要有目的：尽量一次完成一组相关检查，避免无意义的重复调用。
+4. 修改前先查看目标文件或确认已有上下文；修改后运行最小必要验证。
+5. 回复简洁，重点给出结论、下一步或工具调用结果，不要重复大段上下文。
+
+bash 工具约定：
+- 默认工作目录是 ${REPO_ROOT}
+- 搜索优先使用 rg、ls、find、sed -n、cat
+- 编辑时优先使用可重复的命令或小脚本，避免高风险破坏性命令
+- 如果工具输出被截断，应改用更聚焦的命令重新查看
+
+当前运行时预算：
+- 主模型: ${MODEL_NAME}
+- 最大上下文: ~${runtimeConfig.contextWindow} tokens (${runtimeConfig.source === 'api' ? 'API discovery' : '128K fallback'})
+- 启发式压缩阈值: ~${runtimeConfig.compressionThreshold} tokens
+- 预留缓冲: ~${runtimeConfig.reserveTokens} tokens
+
+========== CURRENT CONTEXT ==========
+${renderedContext}
+=====================================`;
+}
+
+function buildCompressionSystemPrompt(runtimeConfig: RuntimeModelConfig): string {
+    return `你是负责上下文压缩的 Meta-Agent，目标是在不丢失当前任务连续性的前提下，为主 Agent 回收上下文空间。
+
+压缩策略（参考 pi 的 compaction 思路）：
+1. 优先折叠旧的 assistant/tool 长输出。
+2. 只有在折叠不足时，才 recycle 最老的一段可见 Scene。
+3. 不要动最新的用户请求、最新的 assistant 响应、以及最新的重要工具结果，除非别无选择。
+4. 动作越少越好，但要把上下文压到阈值以下。
+5. 只返回符合 schema 的动作，不要输出额外文本。
+
+当前预算：
+- 最大上下文: ${runtimeConfig.contextWindow} tokens
+- 压缩阈值: ${runtimeConfig.compressionThreshold} tokens
+- 预留缓冲: ${runtimeConfig.reserveTokens} tokens`;
+}
+
+function resolveToolCwd(cwd?: string): string {
+    const resolved = cwd
+        ? (cwd.startsWith('/') ? resolve(cwd) : resolve(REPO_ROOT, cwd))
+        : REPO_ROOT;
+
+    if (resolved !== REPO_ROOT && !resolved.startsWith(`${REPO_ROOT}/`)) {
+        throw new Error(`cwd must stay inside the repository: ${REPO_ROOT}`);
+    }
+
+    return resolved;
+}
+
+function truncateToolOutput(output: string, runtimeConfig: RuntimeModelConfig): string {
+    const maxChars = clamp(runtimeConfig.reserveTokens * 4, 4_000, 20_000);
+    if (output.length <= maxChars) return output;
+
+    const headLength = Math.floor(maxChars * 0.7);
+    const tailLength = maxChars - headLength;
+    return `${output.slice(0, headLength)}\n\n...[truncated ${output.length - maxChars} chars]...\n\n${output.slice(-tailLength)}`;
+}
+
+function getVisibleScenes(window: ContextWindow): Scene[] {
+    return graph
+        .resolvePath(window.activeStory.headSceneId)
+        .slice(window.windowStartIndex)
+        .filter(scene => scene.type !== 'sentinel');
+}
+
+function buildCompressionSnapshot(window: ContextWindow) {
+    return getVisibleScenes(window).map((scene, index) => {
+        const state = window.getOrAssignState(scene.id);
+        return {
+            index,
+            wid: state.wid,
+            type: scene.type,
+            mode: state.mode,
+            tokenCount: scene.tokenCount,
+            summary: scene.summary,
+        };
+    });
+}
+
+function appendHistorySummary(window: ContextWindow, scenes: Scene[]): void {
+    const addition = scenes
+        .map(scene => {
+            const state = window.getOrAssignState(scene.id);
+            return `[${state.wid}] (${scene.type}) ${scene.summary}`;
+        })
+        .join('\n');
+
+    if (!addition) return;
+
+    window.historySummary = window.historySummary
+        ? `${window.historySummary}\n${addition}`.trim()
+        : addition;
+}
+
+function recycleOldestScenes(window: ContextWindow, count: number): number {
+    const fullPath = graph.resolvePath(window.activeStory.headSceneId);
+    let nextIndex = window.windowStartIndex;
+    let remaining = Math.max(0, count);
+    const scenesToRecycle: Scene[] = [];
+
+    while (nextIndex < fullPath.length && remaining > 0) {
+        const scene = fullPath[nextIndex++];
+        if (scene.type === 'sentinel') continue;
+        scenesToRecycle.push(scene);
+        remaining--;
+    }
+
+    appendHistorySummary(window, scenesToRecycle);
+    window.windowStartIndex = nextIndex;
+    return scenesToRecycle.length;
+}
+
+async function runMetaCompression(storyId: string, runtimeConfig?: RuntimeModelConfig): Promise<CompressionResult> {
+    const storyWindow = windows.get(storyId)!;
+    const runtime = runtimeConfig ?? await getRuntimeModelConfig();
+    const snapshot = buildCompressionSnapshot(storyWindow);
+    const currentPromptTokens = estimateTokenCount(buildAgentSystemPrompt(storyWindow.render(graph), runtime));
+
+    const { output } = await generateText({
+        model: openai(META_MODEL_NAME),
+        system: buildCompressionSystemPrompt(runtime),
+        prompt: `当前窗口快照:\n${JSON.stringify({
+            currentPromptTokens,
+            compressionThreshold: runtime.compressionThreshold,
+            reserveTokens: runtime.reserveTokens,
+            scenes: snapshot,
+        }, null, 2)}`,
+        output: Output.object({
+            schema: z.object({
+                actions: z.array(z.object({
+                    type: z.enum(['collapse', 'recycle']),
+                    wid: z.string().optional(),
+                    count: z.number().int().positive().optional(),
+                    reason: z.string(),
+                })),
+            }),
+        }),
+    });
+
+    const logs: string[] = [];
+
+    for (const act of output.actions as CompressionAction[]) {
+        if (act.type === 'collapse' && act.wid) {
+            const sceneId = Array.from(storyWindow.sceneStateMap.entries()).find(([, value]) => value.wid === act.wid)?.[0];
+            const state = sceneId ? storyWindow.sceneStateMap.get(sceneId) : undefined;
+
+            if (state && state.mode !== DisplayMode.COLLAPSED) {
+                state.mode = DisplayMode.COLLAPSED;
+                logs.push(`折叠了 ${act.wid}: ${act.reason}`);
+            }
+        } else if (act.type === 'recycle' && act.count) {
+            const recycledCount = recycleOldestScenes(storyWindow, act.count);
+            if (recycledCount > 0) {
+                logs.push(`驱逐了最老的 ${recycledCount} 个 Scene: ${act.reason}`);
+            }
+        }
+    }
+
+    return { logs, applied: logs.length > 0 };
+}
 
 // 初始化根节点和第一个哨兵
 const rootId = generateHash('root');
@@ -131,14 +431,14 @@ function appendData(storyId: string, type: NodeType, content: string, summary?: 
 
     // 1. 填充实体节点 (挂载到原哨兵的父节点)
     const entityId = generateHash(content);
-    const entityScene: Scene = {
-        id: entityId,
-        parentId: currentSentinel.parentId,
-        type,
-        content,
-        summary: summary || (content.substring(0, 50) + "..."),
-        tokenCount: Math.ceil(content.length / 4) // 粗略估算
-    };
+        const entityScene: Scene = {
+            id: entityId,
+            parentId: currentSentinel.parentId,
+            type,
+            content,
+            summary: summary || (content.substring(0, 50) + "..."),
+            tokenCount: estimateTokenCount(content)
+        };
     graph.addScene(entityScene);
 
     // 2. 新增哨兵节点
@@ -194,40 +494,72 @@ app.post('/api/chat', async (req: Request, res: Response) => {
     if (message) appendData(activeStoryId, 'user', message);
 
     const window = windows.get(activeStoryId)!;
-    const renderedContext = window.render(graph);
-
-    const systemPrompt = `你是一个强大的系统终端Agent。请分析用户的请求，并使用工具完成任务。
-规则：
-1. 你的唯一状态就是下方的 CURRENT CONTEXT，请基于它进行思考和行动。
-2. 优先使用 bash 工具执行命令。
-3. 对于文件编辑，使用 sed, awk，或者 echo/cat 配合重定向。
-4. 对于搜索，优先使用 rg (ripgrep) 或 grep。
-
-========== CURRENT CONTEXT ==========
-${renderedContext}
-=====================================`;
 
     try {
+        const runtimeConfig = await getRuntimeModelConfig();
+        const autoCompressionLogs: string[] = [];
+        let renderedContext = window.render(graph);
+        let systemPrompt = buildAgentSystemPrompt(renderedContext, runtimeConfig);
+
+        for (let pass = 0; pass < MAX_AUTO_COMPRESSION_PASSES; pass++) {
+            if (estimateTokenCount(systemPrompt) <= runtimeConfig.compressionThreshold) break;
+
+            const compression = await runMetaCompression(activeStoryId, runtimeConfig);
+            autoCompressionLogs.push(...compression.logs);
+            if (!compression.applied) break;
+
+            renderedContext = window.render(graph);
+            systemPrompt = buildAgentSystemPrompt(renderedContext, runtimeConfig);
+        }
+
         const { text, steps } = await generateText({
             model: openai(MODEL_NAME),
             system: systemPrompt,
-            prompt: "请根据 Context 的最新状态继续执行任务。如果需要，直接调用工具。",
+            prompt: "请基于最新 Context 继续完成任务；需要时直接调用工具，不要空转。",
             tools: {
                 bash: tool({
-                    description: '执行系统 bash 命令，返回 stdout 和 stderr',
-                    inputSchema: z.object({ command: z.string() }),
-                    execute: async ({ command }) => {
+                    description: `在仓库内执行 bash 命令。默认 cwd=${REPO_ROOT}，支持可选 cwd 和 timeoutMs，输出可能被截断。`,
+                    inputSchema: z.object({
+                        command: z.string(),
+                        cwd: z.string().optional(),
+                        timeoutMs: z.number().int().positive().max(MAX_TOOL_TIMEOUT_MS).optional(),
+                    }),
+                    execute: async ({ command, cwd, timeoutMs }) => {
+                        const runtime = await getRuntimeModelConfig();
+                        const safeCwd = resolveToolCwd(cwd);
+                        const safeTimeoutMs = clamp(timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS, 1_000, MAX_TOOL_TIMEOUT_MS);
+
                         try {
-                            const { stdout, stderr } = await execAsync(command);
-                            return stdout + (stderr ? `\n[STDERR]:\n${stderr}` : '');
+                            const { stdout, stderr } = await execAsync(command, {
+                                cwd: safeCwd,
+                                timeout: safeTimeoutMs,
+                                maxBuffer: TOOL_MAX_BUFFER_BYTES,
+                            });
+
+                            const combinedOutput = truncateToolOutput(
+                                `${stdout}${stderr ? `\n[STDERR]\n${stderr}` : ''}`.trim() || '[no output]',
+                                runtime,
+                            );
+
+                            return { command, cwd: safeCwd, output: combinedOutput };
                         } catch (e: any) {
-                            return `[EXECUTION ERROR]: ${e.message}`;
+                            const rawOutput = `${e?.stdout ?? ''}${e?.stderr ? `\n[STDERR]\n${e.stderr}` : ''}`.trim();
+                            return {
+                                command,
+                                cwd: safeCwd,
+                                output: truncateToolOutput(rawOutput || `[EXECUTION ERROR] ${e.message}`, runtime),
+                                error: e.message,
+                            };
                         }
-                    }
-                })
+                    },
+                }),
             },
-            stopWhen: stepCountIs(5), // 允许连续调用工具
+            stopWhen: stepCountIs(8),
         });
+
+        for (const log of autoCompressionLogs) {
+            appendData(activeStoryId, 'system', `[自动压缩] ${log}`);
+        }
 
         // 提取并在架构中重构中间步骤
         for (const step of steps) {
@@ -270,7 +602,7 @@ app.post('/api/action', async (req: Request, res: Response) => {
         window.historySummary = typeof summary === 'string' ? summary : '';
     }
     else if (action === 'recycle') {
-        window.windowStartIndex += (count || 1);
+        recycleOldestScenes(window, count || 1);
     }
     else if (action === 'collapse') {
         const state = window.sceneStateMap.get(sceneId);
@@ -291,41 +623,7 @@ app.post('/api/action', async (req: Request, res: Response) => {
         if (state) state.mode = DisplayMode.EXPANDED;
     }
     else if (action === 'meta_compress') {
-        // 冻结当前 Render 结果（这里传 Snapshot）
-        const fullPath = graph.resolvePath(window.activeStory.headSceneId);
-        const snapshot = fullPath.map((s, idx) => {
-            if (s.type === 'sentinel') return null;
-            const state = window.getOrAssignState(s.id);
-            return { wid: state.wid, type: s.type, mode: state.mode, tokenCount: s.tokenCount, isEvicted: idx < window.windowStartIndex };
-        }).filter(Boolean);
-
-        const { output } = await generateText({
-            model: openai(META_MODEL_NAME),
-            system: "你是一个 Meta-Agent。当前 Agent 的 Context 濒临过载，你需要输出压缩指令。只允许使用 collapse(折叠指定WID) 或 recycle(驱逐最老的N个Scene)。",
-            prompt: `当前窗口快照:\n${JSON.stringify(snapshot, null, 2)}`,
-            output: Output.object({
-                schema: z.object({
-                    actions: z.array(z.object({
-                        type: z.enum(['collapse', 'recycle']),
-                        wid: z.string().optional(),
-                        count: z.number().optional(),
-                        reason: z.string()
-                    }))
-                })
-            })
-        });
-
-        // 应用 Meta Agent 的操作
-        const logs: string[] = [];
-        for (const act of output.actions) {
-            if (act.type === 'collapse' && act.wid) {
-                const sId = Array.from(window.sceneStateMap.entries()).find(([k, v]) => v.wid === act.wid)?.[0];
-                if (sId) { window.sceneStateMap.get(sId)!.mode = DisplayMode.COLLAPSED; logs.push(`折叠了 ${act.wid}: ${act.reason}`); }
-            } else if (act.type === 'recycle' && act.count) {
-                window.windowStartIndex += act.count;
-                logs.push(`驱逐了最老的 ${act.count} 个 Scene: ${act.reason}`);
-            }
-        }
+        const logs = (await runMetaCompression(activeStoryId)).logs;
         res.json({ success: true, logs });
         return;
     }
@@ -348,13 +646,14 @@ app.post('/api/action', async (req: Request, res: Response) => {
             newWindow.widCounter = window.widCounter;
             newWindow.sceneStateMap = new Map(JSON.parse(JSON.stringify([...window.sceneStateMap])));
         } else {
-            // 历史节点 Fork: 贪心重建 (倒推 4000 Token)
+            const runtimeConfig = await getRuntimeModelConfig();
+            // 历史节点 Fork: 贪心重建（保留与模型上下文相关的最近窗口）
             const path = graph.resolvePath(targetSceneId);
             let currentTokens = 0;
             let startIndex = path.length - 1;
             while (startIndex >= 0) {
                 currentTokens += path[startIndex].tokenCount;
-                if (currentTokens > 4000) { startIndex++; break; }
+                if (currentTokens > runtimeConfig.forkHistoryTargetTokens) { startIndex++; break; }
                 startIndex--;
             }
             newWindow.windowStartIndex = Math.max(0, startIndex);
