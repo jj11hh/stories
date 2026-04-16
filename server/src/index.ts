@@ -81,6 +81,10 @@ interface CompressionResult {
     applied: boolean;
 }
 
+interface ModelMetadataRecord extends Record<string, unknown> {
+    id?: string;
+}
+
 class StoryGraph {
     public nodes: Map<SceneId, Scene> = new Map();
     addScene(scene: Scene) { this.nodes.set(scene.id, scene); }
@@ -144,6 +148,7 @@ let activeStoryId = 'story_main';
 let runtimeModelConfigPromise: Promise<RuntimeModelConfig> | null = null;
 
 const generateHash = (text: string) => crypto.createHash('md5').update(text + Math.random()).digest('hex').substring(0, 8);
+// Char/4 remains an estimate, but it is sufficient for lightweight context-budget heuristics in this demo.
 const estimateTokenCount = (text: string) => Math.max(1, Math.ceil(text.length / 4));
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
@@ -222,8 +227,10 @@ async function discoverModelContextWindow(): Promise<RuntimeModelConfig> {
         }
 
         const payload = await response.json();
-        const models = Array.isArray(payload?.data) ? payload.data : [];
-        const matchingModel = models.find((model: any) => model?.id === MODEL_NAME) ?? models[0];
+        const models: ModelMetadataRecord[] = Array.isArray(payload?.data)
+            ? payload.data.filter((model: unknown): model is ModelMetadataRecord => !!model && typeof model === 'object')
+            : [];
+        const matchingModel = models.find(model => model.id === MODEL_NAME) ?? models[0];
         const discoveredContextWindow = extractContextWindow(matchingModel);
 
         if (!discoveredContextWindow) {
@@ -275,7 +282,7 @@ ${renderedContext}
 function buildCompressionSystemPrompt(runtimeConfig: RuntimeModelConfig): string {
     return `你是负责上下文压缩的 Meta-Agent，目标是在不丢失当前任务连续性的前提下，为主 Agent 回收上下文空间。
 
-压缩策略（参考 pi 的 compaction 思路）：
+压缩策略（参考 badlogic/pi-mono 中 pi coding agent 的 compaction 思路）：
 1. 优先折叠旧的 assistant/tool 长输出。
 2. 只有在折叠不足时，才 recycle 最老的一段可见 Scene。
 3. 不要动最新的用户请求、最新的 assistant 响应、以及最新的重要工具结果，除非别无选择。
@@ -307,6 +314,23 @@ function truncateToolOutput(output: string, runtimeConfig: RuntimeModelConfig): 
     const headLength = Math.floor(maxChars * 0.7);
     const tailLength = maxChars - headLength;
     return `${output.slice(0, headLength)}\n\n...[truncated ${output.length - maxChars} chars]...\n\n${output.slice(-tailLength)}`;
+}
+
+function getExecErrorDetails(error: unknown): { message: string; stdout: string; stderr: string } {
+    if (error instanceof Error) {
+        const execError = error as Error & { stdout?: string; stderr?: string };
+        return {
+            message: error.message,
+            stdout: execError.stdout ?? '',
+            stderr: execError.stderr ?? '',
+        };
+    }
+
+    return {
+        message: String(error),
+        stdout: '',
+        stderr: '',
+    };
 }
 
 function getVisibleScenes(window: ContextWindow): Scene[] {
@@ -542,13 +566,14 @@ app.post('/api/chat', async (req: Request, res: Response) => {
                             );
 
                             return { command, cwd: safeCwd, output: combinedOutput };
-                        } catch (e: any) {
-                            const rawOutput = `${e?.stdout ?? ''}${e?.stderr ? `\n[STDERR]\n${e.stderr}` : ''}`.trim();
+                        } catch (error: unknown) {
+                            const { message, stdout, stderr } = getExecErrorDetails(error);
+                            const rawOutput = `${stdout}${stderr ? `\n[STDERR]\n${stderr}` : ''}`.trim();
                             return {
                                 command,
                                 cwd: safeCwd,
-                                output: truncateToolOutput(rawOutput || `[EXECUTION ERROR] ${e.message}`, runtime),
-                                error: e.message,
+                                output: truncateToolOutput(rawOutput || `[EXECUTION ERROR] ${message}`, runtime),
+                                error: message,
                             };
                         }
                     },
