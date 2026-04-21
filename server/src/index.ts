@@ -5,7 +5,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
-import { generateText, Output, tool, stepCountIs } from 'ai';
+import { generateText, streamText, Output, tool, stepCountIs } from 'ai';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { z } from 'zod';
 import dotenv from 'dotenv';
@@ -239,6 +239,31 @@ function extractContextWindow(candidate: unknown, depth = 0): number | undefined
     }
 
     return undefined;
+}
+
+function createTraceId(): string {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function previewText(value: string, maxLength = 160): string {
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength)}...`;
+}
+
+function safeJson(value: unknown, maxLength = 800): string {
+    try {
+        const serialized = JSON.stringify(value);
+        if (!serialized) return 'null';
+        return serialized.length <= maxLength ? serialized : `${serialized.slice(0, maxLength)}...`;
+    } catch (error) {
+        return `[unserializable: ${error instanceof Error ? error.message : String(error)}]`;
+    }
+}
+
+function logChat(traceId: string, stage: string, details?: string) {
+    const suffix = details ? ` ${details}` : '';
+    console.log(`[Chat ${traceId}] ${stage}${suffix}`);
 }
 
 async function discoverModelContextWindow(): Promise<RuntimeModelConfig> {
@@ -523,6 +548,7 @@ app.get('/api/state', (_req: Request, res: Response) => {
     const story = stories.get(activeStoryId)!;
     const window = windows.get(activeStoryId)!;
     const fullPath = graph.resolvePath(story.headSceneId);
+    const renderedContext = window.render(graph);
 
     const viewPath = fullPath.map((scene, index) => {
         if (scene.type === 'sentinel') return null;
@@ -539,7 +565,8 @@ app.get('/api/state', (_req: Request, res: Response) => {
         storyIds: Array.from(stories.keys()),
         window: {
             startIndex: window.windowStartIndex,
-            historySummary: window.historySummary
+            historySummary: window.historySummary,
+            renderedContext,
         },
         path: viewPath
     });
@@ -548,28 +575,57 @@ app.get('/api/state', (_req: Request, res: Response) => {
 // 主 Agent 对话接口
 app.post('/api/chat', async (req: Request, res: Response) => {
     const message = typeof req.body?.message === 'string' ? req.body.message : '';
+    const traceId = createTraceId();
     if (message) appendData(activeStoryId, 'user', message);
 
     const window = windows.get(activeStoryId)!;
+    logChat(
+        traceId,
+        'request:start',
+        `story=${activeStoryId} messageLength=${message.length} preview=${JSON.stringify(previewText(message))}`,
+    );
+
+    res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+    });
+    res.write(`data: ${JSON.stringify({ type: 'start' })}\n\n`);
+    res.flushHeaders();
 
     try {
         const runtimeConfig = await getRuntimeModelConfig();
         const autoCompressionLogs: string[] = [];
         let renderedContext = window.render(graph);
         let systemPrompt = buildAgentSystemPrompt(renderedContext, runtimeConfig);
+        logChat(
+            traceId,
+            'prompt:prepared',
+            `contextChars=${renderedContext.length} systemPromptChars=${systemPrompt.length} compressionThreshold=${runtimeConfig.compressionThreshold}`,
+        );
 
         for (let pass = 0; pass < MAX_AUTO_COMPRESSION_PASSES; pass++) {
             if (estimateTokenCount(systemPrompt) <= runtimeConfig.compressionThreshold) break;
 
+            logChat(
+                traceId,
+                'compression:triggered',
+                `pass=${pass + 1} estimatedPromptTokens=${estimateTokenCount(systemPrompt)}`,
+            );
             const compression = await runMetaCompression(activeStoryId, runtimeConfig);
             autoCompressionLogs.push(...compression.logs);
             if (!compression.applied) break;
 
             renderedContext = window.render(graph);
             systemPrompt = buildAgentSystemPrompt(renderedContext, runtimeConfig);
+            logChat(
+                traceId,
+                'compression:applied',
+                `pass=${pass + 1} contextChars=${renderedContext.length} systemPromptChars=${systemPrompt.length}`,
+            );
         }
 
-        const { text, steps } = await generateText({
+        const result = streamText({
             model: provider(MODEL_NAME),
             system: systemPrompt,
             prompt: 'Continue the task using the latest context. Call tools when needed and avoid idle filler.',
@@ -585,6 +641,12 @@ app.post('/api/chat', async (req: Request, res: Response) => {
                         const runtime = await getRuntimeModelConfig();
                         const safeCwd = resolveToolCwd(cwd);
                         const safeTimeoutMs = clamp(timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS, 1_000, MAX_TOOL_TIMEOUT_MS);
+                        const toolStart = Date.now();
+                        logChat(
+                            traceId,
+                            'tool:execute:start',
+                            `name=bash cwd=${JSON.stringify(safeCwd)} timeoutMs=${safeTimeoutMs} command=${JSON.stringify(command)}`,
+                        );
 
                         try {
                             const { stdout, stderr } = await execAsync(command, {
@@ -594,18 +656,34 @@ app.post('/api/chat', async (req: Request, res: Response) => {
                             });
 
                             const combinedOutput = truncateToolOutput(
-                                `${stdout}${stderr ? `\n[STDERR]\n${stderr}` : ''}`.trim() || '[no output]',
+                                `${stdout}${stderr ? `
+[STDERR]
+${stderr}` : ''}`.trim() || '[no output]',
                                 runtime,
+                            );
+
+                            logChat(
+                                traceId,
+                                'tool:execute:success',
+                                `name=bash durationMs=${Date.now() - toolStart} outputLength=${combinedOutput.length} preview=${JSON.stringify(previewText(combinedOutput))}`,
                             );
 
                             return { command, cwd: safeCwd, output: combinedOutput };
                         } catch (error: unknown) {
                             const { message, stdout, stderr } = getExecErrorDetails(error);
-                            const rawOutput = `${stdout}${stderr ? `\n[STDERR]\n${stderr}` : ''}`.trim();
+                            const rawOutput = `${stdout}${stderr ? `
+[STDERR]
+${stderr}` : ''}`.trim();
+                            const output = truncateToolOutput(rawOutput || `[EXECUTION ERROR] ${message}`, runtime);
+                            logChat(
+                                traceId,
+                                'tool:execute:error',
+                                `name=bash durationMs=${Date.now() - toolStart} error=${JSON.stringify(message)} outputLength=${output.length} preview=${JSON.stringify(previewText(output))}`,
+                            );
                             return {
                                 command,
                                 cwd: safeCwd,
-                                output: truncateToolOutput(rawOutput || `[EXECUTION ERROR] ${message}`, runtime),
+                                output,
                                 error: message,
                             };
                         }
@@ -613,7 +691,115 @@ app.post('/api/chat', async (req: Request, res: Response) => {
                 }),
             },
             stopWhen: stepCountIs(8),
+            experimental_onStart: (event) => {
+                logChat(
+                    traceId,
+                    'llm:start',
+                    `model=${event.model.provider}/${event.model.modelId} promptType=${event.messages ? 'messages' : 'prompt'} activeTools=${event.activeTools?.join(',') || 'all'}`,
+                );
+            },
+            experimental_onStepStart: (event) => {
+                logChat(
+                    traceId,
+                    'step:start',
+                    `step=${event.stepNumber} messages=${event.messages.length} previousSteps=${event.steps.length}`,
+                );
+            },
+            experimental_onToolCallStart: (event) => {
+                logChat(
+                    traceId,
+                    'tool:start',
+                    `step=${event.stepNumber ?? 'unknown'} name=${event.toolCall.toolName} args=${safeJson((event.toolCall as any).args ?? (event.toolCall as any).input)}`,
+                );
+            },
+            experimental_onToolCallFinish: (event) => {
+                if (event.success) {
+                    logChat(
+                        traceId,
+                        'tool:finish',
+                        `step=${event.stepNumber ?? 'unknown'} name=${event.toolCall.toolName} success=true durationMs=${event.durationMs} output=${safeJson(event.output)}`,
+                    );
+                    return;
+                }
+
+                logChat(
+                    traceId,
+                    'tool:finish',
+                    `step=${event.stepNumber ?? 'unknown'} name=${event.toolCall.toolName} success=false durationMs=${event.durationMs} error=${safeJson(event.error)}`,
+                );
+            },
+            onChunk: (event) => {
+                if (event.chunk.type === 'tool-call') {
+                    logChat(
+                        traceId,
+                        'stream:tool-call',
+                        `name=${event.chunk.toolName} args=${safeJson((event.chunk as any).args ?? (event.chunk as any).input)}`,
+                    );
+                } else if (event.chunk.type === 'tool-result') {
+                    logChat(
+                        traceId,
+                        'stream:tool-result',
+                        `name=${event.chunk.toolName} result=${safeJson((event.chunk as any).result ?? (event.chunk as any).output ?? (event.chunk as any).toolResult ?? event.chunk)}`,
+                    );
+                } else if (event.chunk.type === 'tool-input-start') {
+                    logChat(
+                        traceId,
+                        'stream:tool-input-start',
+                        `toolCallId=${event.chunk.id} toolName=${event.chunk.toolName}`,
+                    );
+                }
+            },
+            onError: ({ error }) => {
+                logChat(traceId, 'llm:error', `error=${safeJson(error)}`);
+            },
+            onStepFinish: (event) => {
+                logChat(
+                    traceId,
+                    'step:finish',
+                    `step=${event.stepNumber} finishReason=${event.finishReason} toolCalls=${event.toolCalls.length} toolResults=${event.toolResults.length} textLength=${event.text.length} textPreview=${JSON.stringify(previewText(event.text))}`,
+                );
+            },
+            onFinish: (event) => {
+                logChat(
+                    traceId,
+                    'llm:finish',
+                    `finishReason=${event.finishReason} steps=${event.steps.length} totalUsage=${safeJson(event.totalUsage)} finalTextLength=${event.text.length} finalTextPreview=${JSON.stringify(previewText(event.text))}`,
+                );
+            },
         });
+
+        logChat(traceId, 'stream:consume:start');
+
+        for await (const chunk of result.fullStream) {
+            try {
+                if (chunk.type === 'text-delta') {
+                    res.write(`data: ${JSON.stringify({ type: 'text', content: chunk.text })}
+
+`);
+                } else if (chunk.type === 'tool-call') {
+                    res.write(`data: ${JSON.stringify({ type: 'tool_call', name: chunk.toolName, args: (chunk as any).args ?? (chunk as any).input })}
+
+`);
+                } else if (chunk.type === 'tool-result') {
+                    const resultData = (chunk as any).result ?? (chunk as any).output ?? (chunk as any).toolResult ?? chunk;
+                    res.write(`data: ${JSON.stringify({ type: 'tool_result', name: chunk.toolName, result: resultData })}
+
+`);
+                } else if (chunk.type === 'error') {
+                    console.error('Stream chunk error:', chunk.error);
+                    res.write(`data: ${JSON.stringify({ type: 'error', error: String(chunk.error) })}
+
+`);
+                }
+                res.flushHeaders();
+            } catch (err) {
+                console.error('Error writing chunk to SSE:', err);
+            }
+        }
+        logChat(traceId, 'stream:consume:done');
+
+        const steps = await result.steps;
+        logChat(traceId, 'steps:resolved', `count=${steps.length}`);
 
         for (const log of autoCompressionLogs) {
             appendData(activeStoryId, 'system', `[自动压缩] ${log}`);
@@ -629,21 +815,32 @@ app.post('/api/chat', async (req: Request, res: Response) => {
                 appendData(
                     activeStoryId,
                     'assistant',
-                    `[调用工具] ${toolCall.toolName}: ${JSON.stringify(toolCall.input)}`,
+                    `[调用工具] ${toolCall.toolName}: ${JSON.stringify((toolCall as any).args || (toolCall as any).input)}`,
                 );
             }
 
             for (const toolResult of step.toolResults) {
-                appendData(activeStoryId, 'tool', JSON.stringify(toolResult.output ?? toolResult));
+                appendData(activeStoryId, 'tool', JSON.stringify((toolResult as any).result ?? (toolResult as any).output ?? toolResult));
             }
         }
 
-        if (steps.length === 0 && text.trim()) appendData(activeStoryId, 'assistant', text);
-        res.json({ success: true });
+        const finalResultText = await result.text;
+        logChat(
+            traceId,
+            'result:text',
+            `length=${finalResultText.length} preview=${JSON.stringify(previewText(finalResultText))}`,
+        );
+        if (steps.length === 0 && finalResultText.trim()) appendData(activeStoryId, 'assistant', finalResultText);
+        
+        res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+        res.end();
+        logChat(traceId, 'request:done');
     } catch (error: unknown) {
         const message = error instanceof Error ? error.message : 'Unknown error';
         console.error(error);
-        res.status(500).json({ error: message });
+        logChat(traceId, 'request:error', `message=${JSON.stringify(message)}`);
+        res.write(`data: ${JSON.stringify({ type: 'error', error: message })}\n\n`);
+        res.end();
     }
 });
 
