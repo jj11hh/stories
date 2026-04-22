@@ -118,6 +118,12 @@ const Icons = {
       <line x1="12" y1="16" x2="12.01" y2="16" />
     </svg>
   ),
+  Edit3: () => (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+    </svg>
+  ),
   Wrench: () => (
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M14.7 6.3a4 4 0 0 0 5 5L12 19l-4 1 1-4 7.7-7.7a4 4 0 0 0-2-2z" />
@@ -623,6 +629,57 @@ const ToolTimelineCard = ({ entry, expanded, onToggle, onCopy, onCompress }) => 
   </div>
 );
 
+const ContextSummaryCard = ({
+  summary,
+  draft,
+  isEditing,
+  onDraftChange,
+  onEdit,
+  onApply,
+  onCancel,
+  loading,
+}) => (
+  <div className="context-summary-card">
+    <div className="context-summary-header">
+      <div className="context-summary-copy">
+        <div className="context-summary-eyebrow">Evicted Memory</div>
+        <div className="context-summary-title">Context Summary</div>
+        <div className="context-summary-subtitle">Compressed history that remains available after older scenes were recycled.</div>
+      </div>
+      <div className="context-summary-actions">
+        {isEditing ? (
+          <>
+            <button onClick={onCancel} className="context-summary-button" disabled={loading}>
+              <Icons.X /> Cancel
+            </button>
+            <button onClick={onApply} className="context-summary-button context-summary-button-primary" disabled={loading}>
+              <Icons.Check /> Apply
+            </button>
+          </>
+        ) : (
+          <button onClick={onEdit} className="context-summary-button" disabled={loading}>
+            <Icons.Edit3 /> Edit
+          </button>
+        )}
+      </div>
+    </div>
+
+    {isEditing ? (
+      <textarea
+        className="context-summary-editor"
+        rows="5"
+        value={draft}
+        onChange={(event) => onDraftChange(event.target.value)}
+        placeholder="Summarize the evicted portion of the conversation..."
+      />
+    ) : (
+      <div className={`context-summary-body ${summary.trim() ? '' : 'context-summary-body-empty'}`}>
+        {summary.trim() || 'No evicted history summary yet.'}
+      </div>
+    )}
+  </div>
+);
+
 const SceneCard = ({ scene, copiedSceneId, onCopy, onFork, onExpand, onCollapse }) => {
   const isEvicted = scene.isEvicted;
   const isCompressed = scene.mode === 'COLLAPSED';
@@ -721,6 +778,8 @@ function App() {
   const [copiedId, setCopiedId] = useState(null);
   const [debugOpen, setDebugOpen] = useState(false);
   const [expandedToolGroups, setExpandedToolGroups] = useState({});
+  const [historySummaryDraft, setHistorySummaryDraft] = useState('');
+  const [isEditingHistorySummary, setIsEditingHistorySummary] = useState(false);
   const endRef = useRef(null);
   const copyTimeoutRef = useRef(null);
 
@@ -749,6 +808,37 @@ function App() {
       : ''
   ), [state]);
 
+  const conversationEntries = useMemo(() => {
+    const summaryText = state?.window?.historySummary || '';
+    const shouldShowSummaryCard = isEditingHistorySummary || summaryText.trim().length > 0;
+    if (!shouldShowSummaryCard) return renderEntries;
+
+    const firstEvictedIndex = renderEntries.findIndex((entry) => {
+      if (entry.kind === 'scene') return entry.scene.isEvicted;
+      if (entry.kind === 'tool-group') {
+        return entry.scenes?.some((scene) => scene?.isEvicted) || false;
+      }
+      return false;
+    });
+    const insertAt = firstEvictedIndex >= 0 ? firstEvictedIndex : renderEntries.length;
+    return [
+      ...renderEntries.slice(0, insertAt),
+      { kind: 'context-summary', id: 'context-summary-card' },
+      ...renderEntries.slice(insertAt),
+    ];
+  }, [isEditingHistorySummary, renderEntries, state?.window?.historySummary]);
+
+  useEffect(() => {
+    if (!state) return;
+    setHistorySummaryDraft(state.window.historySummary || '');
+    setIsEditingHistorySummary(false);
+  }, [state?.activeStoryId]);
+
+  useEffect(() => {
+    if (!state || isEditingHistorySummary) return;
+    setHistorySummaryDraft(state.window.historySummary || '');
+  }, [isEditingHistorySummary, state?.window?.historySummary, state]);
+
   const markCopied = (id) => {
     setCopiedId(id);
     if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
@@ -774,6 +864,16 @@ function App() {
       sceneId: entry.compressibleSceneId,
       summary: summary === null ? undefined : summary,
     });
+  };
+
+  const applyHistorySummary = async () => {
+    await doAction({ action: 'edit_history', summary: historySummaryDraft });
+    setIsEditingHistorySummary(false);
+  };
+
+  const cancelHistorySummaryEdit = () => {
+    setHistorySummaryDraft(state?.window?.historySummary || '');
+    setIsEditingHistorySummary(false);
   };
 
   const doAction = async (payload) => {
@@ -929,18 +1029,22 @@ function App() {
             </div>
           </div>
 
-          <div className="p-3 border-b border-[#ffa110] bg-[#fff0c2]">
-            <div className="flex items-center gap-2 text-xs font-medium text-[#1f1f1f] mb-2 uppercase tracking-wider opacity-60">
-              <div className="text-[#fa520f]"><Icons.Eye /></div>
-              Context Summary
-            </div>
-            <textarea className="w-full text-xs p-2 rounded bg-[#fffaeb] border border-[#ffa110] text-[#1f1f1f] font-mono focus:outline-none focus:border-[#fa520f] transition-colors" rows="2" defaultValue={state.window.historySummary} onBlur={(e) => doAction({ action: 'edit_history', summary: e.target.value })} placeholder="Evicted context summary..." />
-          </div>
-
           <div className="flex-1 overflow-y-auto p-4 space-y-3">
-            {renderEntries.map((entry) => (
+            {conversationEntries.map((entry) => (
               entry.kind === 'tool-group' ? (
                 <ToolTimelineCard key={entry.id} entry={entry} expanded={!!expandedToolGroups[entry.id]} onToggle={toggleToolGroup} onCopy={copyItem} onCompress={compressToolGroup} />
+              ) : entry.kind === 'context-summary' ? (
+                <ContextSummaryCard
+                  key={entry.id}
+                  summary={state.window.historySummary || ''}
+                  draft={historySummaryDraft}
+                  isEditing={isEditingHistorySummary}
+                  onDraftChange={setHistorySummaryDraft}
+                  onEdit={() => setIsEditingHistorySummary(true)}
+                  onApply={applyHistorySummary}
+                  onCancel={cancelHistorySummaryEdit}
+                  loading={loading}
+                />
               ) : (
                 <SceneCard
                   key={entry.scene.id}
